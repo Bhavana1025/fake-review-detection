@@ -1,0 +1,204 @@
+import sqlite3
+import pandas as pd
+from nltk.corpus import stopwords
+from nltk.tokenize import RegexpTokenizer
+from datetime import datetime
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from time import time
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, pairwise_distances
+from sklearn.metrics import confusion_matrix
+from collections import OrderedDict
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+pd.options.mode.chained_assignment = None  # Disable warning
+
+
+def load_data():
+    print("Loading Data from Database")
+    conn = sqlite3.connect("../Data/yelpResData.db")
+    conn.text_factory = lambda x: str(x, 'gb2312', 'ignore')
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT reviewID, reviewerID, restaurantID, date, rating, usefulCount as reviewUsefulCount, reviewContent, flagged 
+        FROM review 
+        WHERE flagged in ('Y','N')
+    """)
+    review_df = pd.DataFrame(cursor.fetchall(), columns=[column[0] for column in cursor.description])
+
+    cursor.execute("SELECT * FROM reviewer")
+    reviewer_df = pd.DataFrame(cursor.fetchall(), columns=[column[0] for column in cursor.description])
+
+    cursor.execute("SELECT restaurantID, rating as restaurantRating FROM restaurant")
+    restaurant_df = pd.DataFrame(cursor.fetchall(), columns=[column[0] for column in cursor.description])
+
+    df = review_df.merge(reviewer_df, on='reviewerID', how='inner')
+    df = df.merge(restaurant_df, on='restaurantID', how='inner')
+
+    print("Data Load Complete")
+    return df
+
+
+def data_cleaning(df):
+    print("Cleaning Data")
+
+    df['date'] = df['date'].apply(lambda x: x[1:] if x.startswith('\n') else x)
+    df['yelpJoinDate'] = df['yelpJoinDate'].apply(
+        lambda x: datetime.strftime(datetime.strptime(x, '%B %Y'), '01/%m/%Y'))
+
+    stop = stopwords.words('english')
+    tokenizer = RegexpTokenizer(r'\w+')
+    df['reviewContent'] = df['reviewContent'].apply(
+        lambda x: ' '.join(word for word in x.split() if word.lower() not in stop))
+    df['reviewContent'] = df['reviewContent'].apply(lambda x: ' '.join(tokenizer.tokenize(x)))
+    df['reviewContent'] = df['reviewContent'].str.lower()
+
+    print("Data Cleaning Complete")
+    return df
+
+
+def feature_engineering(df):
+    print("Feature Engineering: Creating New Features")
+
+    mnr_df1 = df[['reviewerID', 'date']].copy()
+    mnr_df2 = mnr_df1.groupby(by=['date', 'reviewerID']).size().reset_index(name='mnr')
+    mnr_df2['mnr'] = mnr_df2['mnr'] / mnr_df2['mnr'].max()
+    df = df.merge(mnr_df2, on=['reviewerID', 'date'], how='inner')
+
+    df['rl'] = df['reviewContent'].apply(lambda x: len(x.split()))
+    df['rd'] = abs(df['rating'] - df['restaurantRating']) / 4
+
+    res = OrderedDict()
+    for _, row in df.iterrows():
+        res.setdefault(row.reviewerID, []).append(row.reviewContent)
+
+    individual_reviewer = [{'reviewerID': k, 'reviewContent': v} for k, v in res.items()]
+    reviewers = []
+    similarities = []
+
+    vector = TfidfVectorizer(min_df=0)
+    for reviewer_data in individual_reviewer:
+        try:
+            tfidf = vector.fit_transform(reviewer_data['reviewContent'])
+            cosine = 1 - pairwise_distances(tfidf, metric='cosine')
+            np.fill_diagonal(cosine, -np.inf)
+            max_sim = cosine.max()
+            if max_sim == -np.inf:
+                max_sim = 0
+        except:
+            max_sim = 0
+
+        reviewers.append(reviewer_data['reviewerID'])
+        similarities.append(max_sim)
+
+    df3 = pd.DataFrame({
+        'reviewerID': reviewers,
+        'Maximum Content Similarity': similarities
+    })
+
+    df = pd.merge(df, df3, on="reviewerID", how="left")
+    df.dropna(inplace=True)
+
+    print("Feature Engineering Complete")
+    return df
+
+
+def under_sampling(df):
+    print("Under-Sampling Data")
+    sample_size = len(df[df['flagged'] == 'Y'])
+    authentic = df[df['flagged'] == 'N'].sample(sample_size, random_state=42)
+    fake = df[df['flagged'] == 'Y']
+    return pd.concat([authentic, fake]).sample(frac=1, random_state=42)
+
+
+def semi_supervised_learning(df, model, algorithm, threshold=0.8, iterations=40):
+    print(f"Training {algorithm} Model")
+
+    labels = df['flagged']
+    df = df.drop(['reviewID', 'reviewerID', 'restaurantID', 'date', 'name', 'location',
+                  'yelpJoinDate', 'flagged', 'reviewContent', 'restaurantRating'], axis=1)
+
+    X_train, X_test, y_train, y_test = train_test_split(df, labels, test_size=0.25, random_state=42)
+    X_test_copy = X_test.copy()
+    y_test_copy = y_test.copy()
+
+    current_iteration = 0
+    pbar = tqdm(total=iterations)
+    while not X_test.empty and current_iteration < iterations:
+        current_iteration += 1
+        model.fit(X_train, y_train)
+        probs = model.predict_proba(X_test)
+        preds = model.predict(X_test)
+
+        confident_indices = np.argwhere(probs > threshold)
+        for idx in confident_indices:
+            X_train.loc[X_test.index[idx[0]]] = X_test.iloc[idx[0]]
+            y_train.loc[X_test.index[idx[0]]] = preds[idx[0]]
+
+        X_test.drop(index=X_test.index[confident_indices[:, 0]], inplace=True)
+        y_test.drop(index=y_test.index[confident_indices[:, 0]], inplace=True)
+
+        pbar.update(1)
+    pbar.close()
+
+    final_preds = model.predict(X_test_copy)
+
+    print(f"{algorithm} Model Results")
+    print("--" * 20)
+    print('Accuracy Score :', accuracy_score(y_test_copy, final_preds))
+    print('Precision Score :', precision_score(y_test_copy, final_preds, pos_label="Y"))
+    print('Recall Score :', recall_score(y_test_copy, final_preds, pos_label="Y"))
+    print('F1 Score :', f1_score(y_test_copy, final_preds, pos_label="Y"))
+    print('Confusion Matrix:\n', confusion_matrix(y_test_copy, final_preds))
+
+    plot_confusion_matrix(y_test_copy, final_preds, ['N', 'Y'], f"{algorithm} Confusion Matrix").show()
+
+
+def plot_confusion_matrix(y_true, y_pred, classes, title=None, cmap=plt.cm.Blues):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm, interpolation='nearest', cmap=cmap)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=np.arange(len(classes)), yticks=np.arange(len(classes)),
+           xticklabels=classes, yticklabels=classes, title=title,
+           ylabel='True label', xlabel='Predicted label')
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    fmt = 'd'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+
+    fig.tight_layout()
+    return plt
+
+
+def main():
+    start_time = time()
+    df = load_data()
+    df = data_cleaning(df)
+    df = feature_engineering(df)
+    df = under_sampling(df)
+
+    rf = RandomForestClassifier(random_state=42, criterion='entropy', max_depth=14,
+                                max_features='sqrt', n_estimators=500)
+    nb = GaussianNB()
+
+    semi_supervised_learning(df, model=rf, threshold=0.7, iterations=15, algorithm='Random Forest')
+    semi_supervised_learning(df, model=nb, threshold=0.7, iterations=15, algorithm='Naive Bayes')
+
+    print("Time taken:", time() - start_time)
+
+
+if __name__ == '__main__':
+    main()
