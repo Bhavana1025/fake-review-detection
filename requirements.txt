@@ -1,0 +1,17 @@
+# Core Data Science Libraries
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# Natural Language Processing
+nltk>=3.8.1
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Progress Bars
+tqdm>=4.66.0
+
+# Database
+# Note: sqlite3 is included in Python standard library
